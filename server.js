@@ -71,54 +71,63 @@ if (!fs.existsSync(IMAGES_DIR)) fs.mkdirSync(IMAGES_DIR, { recursive: true });
 if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 
 // Auto-build frontend if dist directory doesn't exist.
-// NOTE: building on the server is fragile in many hosted runtimes (permissions, read-only FS).
-// On first attempt (not production, or any mode), try normal build.
-// If that fails, always attempt fallback build to temp dir (robust approach for Discloud).
+// NOTE: In Discloud, /home/node/dist/ often has permission issues.
+// Strategy: Always attempt fallback build to /tmp (writable temp directory).
 if (!fs.existsSync(DIST_DIR) || !fs.existsSync(path.join(DIST_DIR, 'index.html'))) {
-  console.log('🔧 Dist directory not found. Attempting to build frontend...');
+  console.log('🔧 Dist directory not found or incomplete. Attempting to build frontend...');
   
-  // Try normal build first
+  // First, try to clean up the default dist dir if it exists and is problematic
+  try {
+    if (fs.existsSync(DIST_DIR)) {
+      console.log('   Cleaning up /dist directory...');
+      fs.rmSync(DIST_DIR, { recursive: true, force: true });
+    }
+  } catch (err) {
+    console.warn('   Could not clean /dist (may be read-only):', err.message);
+  }
+  
+  // Always use fallback build to /tmp (avoids permission issues)
+  console.log('🔁 Building frontend to temporary directory (more reliable on Discloud)...');
   let buildSucceeded = false;
+  
   try {
     const { execSync } = await import('child_process');
-    console.log('📦 Running: npm run build');
-    execSync('npm run build', { stdio: 'inherit', cwd: __dirname });
-    console.log('✅ Frontend build completed successfully');
-    buildSucceeded = true;
-  } catch (error) {
-    console.error('❌ Failed to build frontend in default location:', error && error.message ? error.message : error);
-  }
-  
-  // If normal build failed, always attempt fallback build to temp directory
-  if (!buildSucceeded) {
-    console.log('🔁 Normal build failed. Attempting fallback build to temporary directory...');
-    try {
-      const { execSync } = await import('child_process');
-      const tmpDir = path.join(os.tmpdir(), `bsr_dist_${Date.now()}`);
-      console.log(`   Target: ${tmpDir}`);
-      // Ensure tmpDir exists
-      fs.mkdirSync(tmpDir, { recursive: true });
-      // Many build tools (vite) support CLI --outDir to change output directory
-      const buildCmd = `npm run build -- --outDir ${tmpDir}`;
-      console.log('📦 Running fallback:', buildCmd);
-      execSync(buildCmd, { stdio: 'inherit', cwd: __dirname });
-      // Verify fallback build
-      const fallbackIndex = path.join(tmpDir, 'index.html');
-      if (fs.existsSync(fallbackIndex)) {
-        console.log('✅ Fallback build completed successfully to temporary directory');
-        ACTIVE_DIST = tmpDir;
-        buildSucceeded = true;
-      } else {
-        console.warn('⚠️  Fallback build did not produce index.html — frontend may not be available');
-      }
-    } catch (err2) {
-      console.error('❌ Fallback build also failed:', err2 && err2.message ? err2.message : err2);
-      console.warn('⚠️  Server will start but frontend may not work without built files');
+    const tmpDir = path.join(os.tmpdir(), `bsr_dist_${Date.now()}`);
+    console.log(`   Target: ${tmpDir}`);
+    
+    // Ensure tmpDir exists
+    fs.mkdirSync(tmpDir, { recursive: true });
+    
+    // Build with memory-efficient flags and explicit cleanup
+    const buildCmd = `npm run build -- --outDir ${tmpDir} --emptyOutDir`;
+    console.log('📦 Running:', buildCmd);
+    
+    execSync(buildCmd, { 
+      stdio: 'inherit', 
+      cwd: __dirname,
+      env: { ...process.env, NODE_OPTIONS: '--max-old-space-size=256' },
+      timeout: 120000 // 2-minute timeout
+    });
+    
+    // Verify build
+    const builtIndex = path.join(tmpDir, 'index.html');
+    if (fs.existsSync(builtIndex)) {
+      console.log('✅ Frontend build completed successfully to temporary directory');
+      ACTIVE_DIST = tmpDir;
+      buildSucceeded = true;
+    } else {
+      console.warn('⚠️  Build completed but index.html not found at:', builtIndex);
     }
+  } catch (err) {
+    console.error('❌ Build failed:', err && err.message ? err.message : err);
   }
   
   if (!buildSucceeded) {
-    console.warn('⚠️⚠️⚠️ Could not build frontend. Check build logs and ensure npm dependencies are installed.');
+    console.error('❌❌❌ Frontend build failed. Troubleshooting:');
+    console.error('    1. Check if npm dependencies are installed: npm ci');
+    console.error('    2. Ensure 512MB+ RAM available');
+    console.error('    3. Verify /tmp directory has write permissions');
+    console.error('    Frontend will NOT be available');
   }
 }
 
