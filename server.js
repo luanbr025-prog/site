@@ -1,6 +1,7 @@
 import express from 'express';
 import fs from 'fs';
 import path from 'path';
+import os from 'os';
 import { fileURLToPath } from 'url';
 import session from 'express-session';
 import multer from 'multer';
@@ -44,6 +45,9 @@ process.env.SESSION_SECRET = process.env.SESSION_SECRET || 'dev-secret-change-in
 process.env.STEAM_API_KEY = process.env.STEAM_API_KEY || '';
 
 // Log startup info
+process.env.STEAM_ADMINS = process.env.STEAM_ADMINS || ''; // Comma-separated Steam IDs
+
+// Log startup info
 console.log(`✅ BSR Server Starting`);
 console.log(`📌 Environment: ${process.env.NODE_ENV}`);
 console.log(`🔐 Steam configured: ${process.env.STEAM_API_KEY ? 'Yes' : 'No'}`);
@@ -59,22 +63,62 @@ const __dirname = path.dirname(__filename);
 
 // Directories
 const DIST_DIR = path.join(__dirname, 'dist');
+// ACTIVE_DIST will point to the directory we actually serve (may be DIST_DIR or a temp build dir)
+let ACTIVE_DIST = DIST_DIR;
 const IMAGES_DIR = path.join(__dirname, 'public', 'assets', 'images');
 const DATA_DIR = path.join(__dirname, 'data');
 if (!fs.existsSync(IMAGES_DIR)) fs.mkdirSync(IMAGES_DIR, { recursive: true });
 if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 
-// Auto-build frontend if dist directory doesn't exist (for Discloud deployment)
+// Auto-build frontend if dist directory doesn't exist.
+// NOTE: building on the server is fragile in many hosted runtimes (permissions, read-only FS).
+// On first attempt (not production, or any mode), try normal build.
+// If that fails, always attempt fallback build to temp dir (robust approach for Discloud).
 if (!fs.existsSync(DIST_DIR) || !fs.existsSync(path.join(DIST_DIR, 'index.html'))) {
   console.log('🔧 Dist directory not found. Attempting to build frontend...');
+  
+  // Try normal build first
+  let buildSucceeded = false;
   try {
     const { execSync } = await import('child_process');
     console.log('📦 Running: npm run build');
     execSync('npm run build', { stdio: 'inherit', cwd: __dirname });
     console.log('✅ Frontend build completed successfully');
+    buildSucceeded = true;
   } catch (error) {
-    console.error('❌ Failed to build frontend:', error);
-    console.warn('⚠️  Server will start but frontend may not work without built files');
+    console.error('❌ Failed to build frontend in default location:', error && error.message ? error.message : error);
+  }
+  
+  // If normal build failed, always attempt fallback build to temp directory
+  if (!buildSucceeded) {
+    console.log('🔁 Normal build failed. Attempting fallback build to temporary directory...');
+    try {
+      const { execSync } = await import('child_process');
+      const tmpDir = path.join(os.tmpdir(), `bsr_dist_${Date.now()}`);
+      console.log(`   Target: ${tmpDir}`);
+      // Ensure tmpDir exists
+      fs.mkdirSync(tmpDir, { recursive: true });
+      // Many build tools (vite) support CLI --outDir to change output directory
+      const buildCmd = `npm run build -- --outDir ${tmpDir}`;
+      console.log('📦 Running fallback:', buildCmd);
+      execSync(buildCmd, { stdio: 'inherit', cwd: __dirname });
+      // Verify fallback build
+      const fallbackIndex = path.join(tmpDir, 'index.html');
+      if (fs.existsSync(fallbackIndex)) {
+        console.log('✅ Fallback build completed successfully to temporary directory');
+        ACTIVE_DIST = tmpDir;
+        buildSucceeded = true;
+      } else {
+        console.warn('⚠️  Fallback build did not produce index.html — frontend may not be available');
+      }
+    } catch (err2) {
+      console.error('❌ Fallback build also failed:', err2 && err2.message ? err2.message : err2);
+      console.warn('⚠️  Server will start but frontend may not work without built files');
+    }
+  }
+  
+  if (!buildSucceeded) {
+    console.warn('⚠️⚠️⚠️ Could not build frontend. Check build logs and ensure npm dependencies are installed.');
   }
 }
 
@@ -92,7 +136,23 @@ function writeAccounts(arr){
 const PORT = process.env.PORT || 8080;
 
 // Basic middleware
-app.use(helmet());
+// Configure Helmet with a Content Security Policy that allows Steam avatar images
+app.use(helmet({
+  contentSecurityPolicy: {
+    directives: {
+      defaultSrc: ["'self'"],
+      scriptSrc: ["'self'", "'unsafe-inline'", 'https:'],
+      styleSrc: ["'self'", "'unsafe-inline'", 'https:'],
+      imgSrc: ["'self'", 'data:', 'https://avatars.steamstatic.com', 'https://steamcdn-a.akamaihd.net', 'https:'],
+      connectSrc: ["'self'", 'https:'],
+      fontSrc: ["'self'", 'https:', 'data:'],
+      objectSrc: ["'none'"],
+      frameAncestors: ["'none'"],
+      baseUri: ["'self'"],
+      formAction: ["'self'"]
+    }
+  }
+}));
 app.use(compression());
 app.use(cors());
 app.use(express.json());
@@ -116,10 +176,16 @@ app.use(session({
   cookie: {
     httpOnly: true,
     sameSite: 'lax',
-    secure: process.env.NODE_ENV === 'production',
+    // Only set secure cookies when FRONTEND_URL is HTTPS (avoids Secure cookie on http://localhost)
+    secure: (process.env.NODE_ENV === 'production') && ((process.env.FRONTEND_URL || '').startsWith('https')),
     maxAge: 24 * 60 * 60 * 1000
   }
 }));
+
+// Log session cookie configuration for debugging
+try {
+  console.log('Session cookie config -> secure:', (process.env.NODE_ENV === 'production') && ((process.env.FRONTEND_URL || '').startsWith('https')), 'sameSite: lax');
+} catch (e) {}
 
 // Initialize passport
 app.use(passport.initialize());
@@ -207,26 +273,43 @@ function writeSettings(data){ writeJSON(SETTINGS_FILE, data); }
 
 // Admin helpers
 function getAdmins(){
-  const raw = process.env.ADMIN_USERS || '';
+  const raw = process.env.STEAM_ADMINS || '';
   if(!raw) return {};
-  return raw.split(',').reduce((acc, token)=>{
-    const t = String(token||'').trim(); if(!t) return acc;
-    if(t.includes(':')){ const [u,p]=t.split(':'); if(u) acc[u.trim()]=(p||'').trim(); return acc; }
-    if(/^\d+$/.test(t)){ acc['steam_'+t]=true; acc[t]=true; return acc; }
-    acc[t]=true; const m = t.match(/^steam_(\d+)$/); if(m) acc[m[1]] = true; return acc;
+  // Parse comma-separated Steam IDs and create a lookup map
+  return raw.split(',').reduce((acc, steamId)=>{
+    const id = String(steamId||'').trim();
+    if(id) acc[id] = true;
+    return acc;
   }, {});
 }
+
+function getSteamIdFromUsername(username) {
+  // Extract Steam ID from username format like "steam_76561198419559590"
+  const match = username.match(/^steam_(\d+)$/);
+  return match ? match[1] : null;
+}
+
 function requireAuth(req,res,next){ if(req.session && req.session.user) return next(); return res.status(401).json({ok:false, message:'Não autorizado'}); }
-function requireAdmin(req,res,next){ if(!req.session || !req.session.user) return res.status(401).json({ok:false, message:'Não autorizado'}); const admins = getAdmins(); if(!admins[req.session.user.username]) return res.status(403).json({ok:false, message:'Acesso negado: apenas administradores'}); next(); }
+function requireAdmin(req,res,next){ 
+  if(!req.session || !req.session.user) return res.status(401).json({ok:false, message:'Não autorizado'}); 
+  const admins = getAdmins(); 
+  const steamId = getSteamIdFromUsername(req.session.user.username);
+  if(!steamId || !admins[steamId]) return res.status(403).json({ok:false, message:'Acesso negado: apenas administradores'}); 
+  next(); 
+}
 
 // Session and admin check endpoints
 app.get('/api/session', (req,res)=>{
+  try {
+    console.log('API /api/session', 'sessionID:', req.sessionID, 'user:', req.session && req.session.user ? req.session.user.username : null);
+  } catch (e) { console.log('Session log error', e); }
   res.json({ user: req.session && req.session.user ? req.session.user : null });
 });
 app.get('/api/admin/check', (req,res)=>{
   if(!req.session || !req.session.user) return res.json({ isAdmin:false });
   const admins = getAdmins();
-  res.json({ isAdmin: !!admins[req.session.user.username] });
+  const steamId = getSteamIdFromUsername(req.session.user.username);
+  res.json({ isAdmin: !!(steamId && admins[steamId]) });
 });
 
 // Logout
@@ -460,7 +543,22 @@ app.get('/api/public/stats', (req, res) => {
 
 // Accounts management for admin
 app.get('/api/accounts', requireAdmin, (req,res)=>{ res.json(readAccounts()); });
-app.put('/api/accounts/:username', requireAdmin, (req,res)=>{ const username = req.params.username; const data = readAccounts(); const idx = data.findIndex(a=>a.username===username); if(idx===-1) return res.status(404).json({ok:false}); data[idx]=Object.assign({}, data[idx], req.body); writeAccounts(data); res.json({ok:true, account:data[idx]}); });
+app.post('/api/accounts', requireAdmin, (req, res) => {
+  try {
+    const account = req.body;
+    if (!account || !account.username) return res.status(400).json({ ok: false, message: 'username is required' });
+    const data = readAccounts();
+    if (data.find(a => a.username === account.username)) return res.status(409).json({ ok: false, message: 'username already exists' });
+    data.push(account);
+    writeAccounts(data);
+    return res.json(account);
+  } catch (e) {
+    console.error('Failed to create account', e);
+    return res.status(500).json({ ok: false, message: 'Failed to create account' });
+  }
+});
+
+app.put('/api/accounts/:username', requireAdmin, (req,res)=>{ const username = req.params.username; const data = readAccounts(); const idx = data.findIndex(a=>a.username===username); if(idx===-1) return res.status(404).json({ok:false}); data[idx]=Object.assign({}, data[idx], req.body); writeAccounts(data); res.json(data[idx]); });
 app.delete('/api/accounts/:username', requireAdmin, (req,res)=>{ const username = req.params.username; const data = readAccounts(); const idx = data.findIndex(a=>a.username===username); if(idx===-1) return res.status(404).json({ok:false}); const removed = data.splice(idx,1)[0]; writeAccounts(data); res.json({ok:true, removed}); });
 
 // Multer for uploads
@@ -485,7 +583,7 @@ app.get('/api/csrf', (req, res) => {
 // Add lightweight logging for /auth routes to help debug callback issues
 app.use('/auth', (req, res, next) => {
   try {
-    console.log('Auth request:', req.method, req.originalUrl, 'query:', req.query, 'sessionID:', req.sessionID);
+    console.log('Auth request:', req.method, req.originalUrl, 'query:', req.query, 'sessionID:', req.sessionID, 'hasUser:', !!(req.session && req.session.user));
   } catch (e) {
     console.log('Auth logging error', e);
   }
@@ -552,6 +650,9 @@ app.get('/auth/steam/return', passport.authenticate('steam', {
     // Save accounts to file
     writeAccounts(accounts);
 
+    // Log incoming session state before setting user
+    try { console.log('Steam callback incoming', 'sessionID:', req.sessionID, 'hasUserBefore:', !!(req.session && req.session.user)); } catch(e){}
+
     // Set session
     req.session.user = {
       username: account.username,
@@ -568,6 +669,7 @@ app.get('/auth/steam/return', passport.authenticate('steam', {
         return res.redirect(process.env.FRONTEND_URL);
       }
       
+      try { console.log('Steam callback saved session', 'sessionID:', req.sessionID, 'user:', req.session.user && req.session.user.username); } catch(e){}
       console.log(`✅ Auth success: ${displayName} (${steamId})`);
       return res.redirect(process.env.FRONTEND_URL);
     });
@@ -578,9 +680,9 @@ app.get('/auth/steam/return', passport.authenticate('steam', {
   }
 });
 
-// Serve static assets from the built `dist` directory
-if (fs.existsSync(DIST_DIR)) {
-  app.use(express.static(DIST_DIR, { maxAge: '1d' }));
+// Serve static assets from the active dist directory (may be fallback temp dir)
+if (fs.existsSync(ACTIVE_DIST)) {
+  app.use(express.static(ACTIVE_DIST, { maxAge: '1d' }));
 }
 
 // Upload endpoint (example)
@@ -660,7 +762,7 @@ app.use((req, res, next) => {
     return next();
   }
 
-  const indexPath = path.join(DIST_DIR, 'index.html');
+  const indexPath = path.join(ACTIVE_DIST, 'index.html');
   if (fs.existsSync(indexPath)) return res.sendFile(indexPath);
   return next();
 });
@@ -691,7 +793,7 @@ app.use((req, res) => {
 
   // For non-API routes, serve HTML if available
   if (req.accepts('html')) {
-    const indexPath = path.join(DIST_DIR, 'index.html');
+    const indexPath = path.join(ACTIVE_DIST, 'index.html');
     if (fs.existsSync(indexPath)) {
       return res.sendFile(indexPath);
     }
